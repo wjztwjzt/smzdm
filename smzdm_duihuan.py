@@ -1,349 +1,469 @@
-import re
-import requests
-from bs4 import BeautifulSoup
-from typing import List, Dict
-import json
+"""
+兑换礼品 + 获取「我的礼品」列表并解析审核状态/券码。
+
+环境变量：
+- SMZDM_COOKIE: cookies#安全码
+  - 可配置多账号：用 & 或换行分隔多个条目
+  - 例：SMZDM_COOKIE="cookie1#pass1&cookie2#pass2"
+- SMZDM_GIFT_ID: 要兑换的礼品 ID（默认 800911）
+- SMZDM_GIFT_HTML_FILE: 若设置，从该文件读取 HTML（调试用，不请求网络）
+- SMZDM_DEBUG_HTML: 设为 1 时，将请求到的 HTML 保存为 smzdm_gift_debug.html
+"""
+
+from __future__ import annotations
+
 import os
+import re
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
+import time
+import requests
 
-from smzdm_bot import bark_notify
-from smzdm_db import init_db, save_gift_items
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore[assignment]
+
+from smzdm_bot import get_env_cookies_raw, PROXIES
 
 
-def h_html(cookie: str, out_file: str = "smzdm_response.html") -> str:
-    url = "https://duihuan.smzdm.com/"
+UA_PC = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+)
 
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "cache-control": "max-age=0",
-        "cookie": cookie,
-        # "priority": "u=0, i",
-        # "referer": "https://duihuan.smzdm.com/",
-        # "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-        # "sec-ch-ua-mobile": "?0",
-        # "sec-ch-ua-platform": '"Windows"',
-        # "sec-fetch-dest": "document",
-        # "sec-fetch-mode": "navigate",
-        # "sec-fetch-site": "same-origin",
-        # "sec-fetch-user": "?1",
-        # "upgrade-insecure-requests": "1",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-    }
 
-    # 发送GET请求
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-        
-        # # 打印响应状态码
-        # print(f"状态码: {response.status_code}")
-        # print(f"响应头: {response.headers}")
-        
-        # # 打印响应内容（前500个字符）
-        # print(f"响应内容 (前500字符): {response.text[:500]}...")
-        
-        # 保存响应到文件（便于排查）
-        with open(out_file, "w", encoding="utf-8") as f:
-            f.write(response.text)
-        print(f"响应已保存到 {out_file}")
+@dataclass
+class GiftRecord:
+    title: str
+    url: str
+    status: str  # 审核中 / 审核通过 ...
+    date_text: str  # 刚刚 / 2024-08-27 ...
+    secret: str  # 券码/密码（如果页面里有）
+    gift_id: str
 
-        return response.text
-        
-    except requests.exceptions.RequestException as e:
-        print(f"请求失败: {e}")
+
+def _strip_to_html(text: str) -> str:
+    """
+    兼容你粘贴的那种：前面带 HTTP/1.1 200 OK 头 + chunk 长度。
+    requests 正常拿到的是纯 HTML；如果前面有杂质，这里尽量裁切到 HTML 开头。
+    """
+    if not text:
         return ""
+    m = re.search(r"(?is)(<!doctype\s+html|<html\b)", text)
+    return text[m.start() :] if m else text
 
 
+def _split_cookie_and_safe_pass(raw_cookie: str) -> tuple[str, str]:
+    """
+    输入：cookies#安全码
+    输出：(cookies, 安全码)
+    """
+    raw_cookie = (raw_cookie or "").strip()
+    if "#" not in raw_cookie:
+        return raw_cookie, ""
+    cookie, safe_pass = raw_cookie.split("#", 1)
+    return cookie.strip(), safe_pass.strip()
 
-def parse_exchange_items(html_content: str) -> List[Dict]:
-    """解析礼品兑换信息"""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # 找到所有礼品兑换项
-    exchange_items = soup.find_all('li', class_='exchange-item')
-    
-    results = []
-    
-    for item in exchange_items:
-        try:
-            # 提取礼品链接
-            link_tag = item.find('a', class_='exchange-link')
-            name = link_tag.text.strip() if link_tag else "未知商品"
-            
-            href_tag = item.find('a', class_='exchange-image')
-            href = href_tag.get('href', '') if href_tag else ""
-            full_url = f"https://duihuan.smzdm.com{href}" if href else ""
-            
-            # 提取data-pre-p属性（价格）
-            price_div = item.find('div', class_='ticket-info-bottom')
-            data_pre_p = price_div.get('data-pre-p', '') if price_div else ""
-            
-            # 提取显示的价格文本（如"3000金币"）
-            price_span = price_div.find('span') if price_div else None
-            price_text = price_span.text.strip() if price_span else ""
-            
-            # 提取已领和剩余数量
-            info_top = item.find('div', class_='ticket-info-top')
-            claimed = ""
-            remaining = ""
-            
-            if info_top:
-                # 查找所有文本节点
-                texts = info_top.find_all(text=True, recursive=False)
-                spans = info_top.find_all('span')
-                
-                # 提取已领数量（第一个span后的文本）
-                if spans and len(spans) > 0:
-                    # 获取第一个span后面的文本
-                    for node in info_top.contents:
-                        if node.name == 'span' and '已领' in str(node):
-                            # 获取这个span后面的文本节点
-                            next_node = node.next_sibling
-                            if next_node:
-                                claimed = str(next_node).strip()
-                                break
-                
-                # 提取剩余数量（第二个span的span标签内的文本）
-                if len(spans) > 1:
-                    second_span = spans[1]
-                    remaining_span = second_span.find_next('span', class_='ticket-info-red')
-                    if remaining_span:
-                        remaining = remaining_span.text.strip()
-            
-            # 添加到结果列表
-            results.append({
-                'name': name,
-                'href': href,
-                'full_url': full_url,
-                'data_pre_p': data_pre_p,
-                'price_text': price_text,
-                'claimed': claimed,
-                'remaining': remaining
-            })
-            
-        except Exception as e:
-            print(f"解析错误: {e}")
-            continue
-    
-    return results
 
-def parse_all_items(html_content: str) -> Dict:
-    """解析所有类型的商品信息"""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    results = {
-        'coupons': [],  # 优惠券
-        'lucky_items': [],  # 幸运屋
-        'exchange_items': []  # 礼品兑换
+def iter_cookie_pairs() -> Iterable[tuple[str, str]]:
+    """
+    从项目环境变量读取 cookies 列表，并拆出 cookie/safe_pass。
+    """
+    # 兑换任务需要拿到带 # 的原始值，再手动拆出安全码
+    raw_list = get_env_cookies_raw() or []
+    for raw in raw_list:
+        cookie, safe_pass = _split_cookie_and_safe_pass(raw)
+        if cookie:
+            yield cookie, safe_pass
+
+
+def post_exchange(cookie: str, safe_pass: str, gift_id: str) -> dict:
+    """
+    POST https://duihuan.smzdm.com/quan/lingqugift/{gift_id}
+    """
+    url = f"https://duihuan.smzdm.com/quan/lingqugift/{gift_id}"
+    headers = {
+        "Host": "duihuan.smzdm.com",
+        "Connection": "keep-alive",
+        "sec-ch-ua-platform": "\"Windows\"",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": UA_PC,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "sec-ch-ua": "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "sec-ch-ua-mobile": "?0",
+        "Origin": "https://duihuan.smzdm.com",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Referer": f"https://duihuan.smzdm.com/d/{gift_id}/",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
+        "Cookie": cookie,
     }
-    
-    # 1. 解析优惠券
-    discount_items = soup.find_all('li', class_='ticket')
-    for item in discount_items:
+    data = {
+        "safe_pass": safe_pass,
+        "client_type": "PC",
+        "sourcePage": f"https://duihuan.smzdm.com/d/{gift_id}/",
+    }
+
+    # 先走 SOCKS5 代理，如果失败再直连
+    proxy_enabled = bool(PROXIES)
+    last_error: Optional[Exception] = None
+
+    for _ in range(2):
         try:
-            # 提取优惠券名称
-            title_tag = item.find('div', class_='ticket-title').find('a')
-            name = title_tag.text.strip() if title_tag else ""
-            href = title_tag.get('href', '') if title_tag else ""
-            
-            # 提取价格
-            cost_div = item.find('div', class_='ticket-cost')
-            price = cost_div.find('span').text.strip() if cost_div else ""
-            price_unit = "金币" if cost_div else ""
-            
-            results['coupons'].append({
-                'name': name,
-                'href': href,
-                'price': f"{price}{price_unit}"
-            })
-        except:
-            continue
-    
-    # 2. 解析幸运屋商品
-    lucky_items = soup.find_all('li', class_='lucky-border')
-    for item in lucky_items:
-        try:
-            title_tag = item.find('a', class_='title')
-            name = title_tag.text.strip() if title_tag else ""
-            
-            # 提取进度数据
-            data_div = item.find('div', class_='data')
-            progress_data = data_div.text.strip() if data_div else ""
-            
-            # 解析进度数据（格式：11809/21331）
-            if '/' in progress_data:
-                current, total = progress_data.split('/')
-                progress = {
-                    'current': current.strip(),
-                    'total': total.strip(),
-                    'percentage': f"{int(current)/int(total)*100:.1f}%" if current.isdigit() and total.isdigit() else "0%"
-                }
-            else:
-                progress = {'current': '0', 'total': '0', 'percentage': '0%'}
-            
-            results['lucky_items'].append({
-                'name': name,
-                'progress': progress
-            })
-        except:
-            continue
-    
-    # 3. 解析礼品兑换（使用上面定义的函数）
-    results['exchange_items'] = parse_exchange_items(html_content)
-    
-    return results
-
-def save_to_json(data: Dict, filename: str):
-    """保存数据到JSON文件"""
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"数据已保存到 {filename}")
-
-def save_to_csv(data: Dict, filename: str):
-    """保存礼品兑换数据到CSV文件"""
-    import csv
-    
-    # 只保存礼品兑换数据
-    exchange_items = data.get('exchange_items', [])
-    
-    if not exchange_items:
-        print("没有礼品兑换数据")
-        return
-    
-    with open(filename, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        # 写入表头
-        writer.writerow(['商品名称', '链接', '完整URL', 'data-pre-p属性', '价格文本', '已领数量', '剩余数量'])
-        
-        # 写入数据
-        for item in exchange_items:
-            writer.writerow([
-                item['name'],
-                item['href'],
-                item['full_url'],
-                item['data_pre_p'],
-                item['price_text'],
-                item['claimed'],
-                item['remaining']
-            ])
-    
-    print(f"CSV数据已保存到 {filename}")
-
-def main():
-    # 这里只负责爬取兑换首页的商品列表，并将礼品兑换区块写入 sqlite3。
-    # Cookie 使用新的 smzdm_duihuan / smzdm_safe 方案中的完整 cookie 串。
-    raw = os.getenv("smzdm_duihuan", "") or ""
-    if not raw:
-        print("\n请先设置 smzdm_duihuan 环境变量")
-        return
-
-    init_db()
-
-    cookie_list = [c.strip() for c in raw.split("#") if c.strip()]
-    if not cookie_list:
-        print("\nsmzdm_duihuan 环境变量为空")
-        return
-
-    all_data = None
-
-    # 按顺序尝试 cookie：没数据就换下一个；有数据就停止
-    for idx, cookie in enumerate(cookie_list, start=1):
-        print(f"\n开始使用第 {idx} 个 cookie 请求兑换首页...")
-        html_content = h_html(cookie=cookie, out_file=f"smzdm_response_{idx}.html")
-        if not html_content:
-            print("本次未获取到 HTML，尝试下一个 cookie...")
-            continue
-
-        print("开始解析数据...")
-        parsed = parse_all_items(html_content)
-
-        # 以“礼品兑换列表”为是否成功的判断依据
-        exchange_items = parsed.get("exchange_items", []) if isinstance(parsed, dict) else []
-        if exchange_items:
-            all_data = parsed
-            print(f"已成功解析到 {len(exchange_items)} 个礼品兑换条目，停止尝试后续 cookie。")
+            resp = requests.post(
+                url,
+                headers=headers,
+                data=data,
+                timeout=20,
+                proxies=PROXIES if proxy_enabled else None,
+            )
+            try:
+                return resp.json()
+            except Exception:
+                return {"status_code": resp.status_code, "text": resp.text}
+        except Exception as e:
+            last_error = e
+            if proxy_enabled:
+                # 代理失败，关掉代理再试一次
+                proxy_enabled = False
+                continue
             break
 
-        print("未解析到礼品兑换数据，尝试下一个 cookie...")
-    
-    if not all_data:
-        print("\n所有 cookie 都未解析到礼品兑换数据。")
-        bark_notify("什么值得买兑换页抓取失败", "所有账号均未获取到礼品兑换列表")
-        return
+    return {"isSuccess": False, "error": repr(last_error)}
 
-    # 打印礼品兑换信息
-    print("\n=== 礼品兑换信息 ===")
-    for i, item in enumerate(all_data['exchange_items'], 1):
-        print(f"\n商品 {i}:")
-        print(f"  名称: {item['name']}")
-        print(f"  链接: {item['href']}")
-        print(f"  完整URL: {item['full_url']}")
-        print(f"  data-pre-p: {item['data_pre_p']}")
-        print(f"  价格: {item['price_text']}")
-        print(f"  已领: {item['claimed']}")
-        print(f"  剩余: {item['remaining']}")
 
-    # 写入数据库 gift_items
-    def _extract_gift_id_from_href(href: str) -> str:
-        m = re.search(r"/d/(\d+)", href or "")
-        return m.group(1) if m else ""
+def get_gift_page(cookie: str, page: int = 1) -> str:
+    """
+    GET 我的礼品页。第 1 页 /user/gift/，第 n 页 /user/gift/p{n}/。
+    """
+    if page <= 1:
+        url = "https://zhiyou.smzdm.com/user/gift/"
+    else:
+        url = f"https://zhiyou.smzdm.com/user/gift/p{page}/"
+    headers = {
+        "Host": "zhiyou.smzdm.com",
+        "Connection": "keep-alive",
+        "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": UA_PC,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+            "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+        ),
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
+        "Sec-Fetch-Dest": "document",
+        "Referer": "https://zhiyou.smzdm.com/user/coupon/",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
+        "Cookie": cookie,
+    }
 
-    gift_rows = []
-    for item in all_data["exchange_items"]:
-        gift_id = _extract_gift_id_from_href(item.get("href", ""))
-        if not gift_id:
+    proxy_enabled = bool(PROXIES)
+    last_error: Optional[Exception] = None
+
+    for _ in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers=headers,
+                timeout=20,
+                proxies=PROXIES if proxy_enabled else None,
+            )
+            return resp.text
+        except Exception as e:
+            last_error = e
+            if proxy_enabled:
+                proxy_enabled = False
+                continue
+            break
+
+    return f"请求礼品页面失败: {last_error!r}"
+
+
+# 分页链接：/user/gift/p2/、p3/ 等
+_RE_PAGE = re.compile(r"/user/gift/p(\d+)/", re.I)
+
+
+def _parse_max_page(html: str) -> int:
+    """从分页区解析最大页码，未找到则返回 1。"""
+    raw = _strip_to_html(html)
+    nums = [int(m.group(1)) for m in _RE_PAGE.finditer(raw)]
+    return max(nums, default=1)
+
+
+def get_all_gift_pages(cookie: str) -> tuple[List[GiftRecord], str]:
+    """
+    拉取所有分页的「我的礼品」，解析后合并为一条记录列表。
+    返回 (记录列表, 第 1 页 HTML)，供调试保存用。
+    """
+    all_records: List[GiftRecord] = []
+    page1 = get_gift_page(cookie, 1)
+    if page1.startswith("请求礼品页面失败"):
+        return all_records, page1
+
+    first = parse_gift_records(page1)
+    all_records.extend(first)
+    max_page = _parse_max_page(page1)
+    if max_page <= 1:
+        return all_records, page1
+
+    for p in range(2, max_page + 1):
+        html = get_gift_page(cookie, p)
+        if html.startswith("请求礼品页面失败"):
+            break
+        rec = parse_gift_records(html)
+        all_records.extend(rec)
+        if not rec:
+            break
+    return all_records, page1
+
+
+def _extract_gift_id(url: str) -> str:
+    """
+    从 https://duihuan.smzdm.com/d/800626  或 /d/800626/ 提取 800626
+    """
+    m = re.search(r"/d/(\d+)", url or "")
+    return m.group(1) if m else ""
+
+
+def _clean_title(s: str) -> str:
+    """去掉标题末尾的 " >"、" ›" 等（来自 <em>&gt;</em>）。"""
+    if not s:
+        return s
+    return re.sub(r"\s*[>›]\s*$", "", s).strip()
+
+
+# 正则回退：匹配 href 里 duihuan.smzdm.com/d/ 数字
+_RE_GIFT_HREF = re.compile(
+    r'href\s*=\s*["\'](https?://duihuan\.smzdm\.com/d/(\d+)[^"\']*)["\']',
+    re.I,
+)
+
+
+def _parse_gift_records_regex(html: str) -> List[GiftRecord]:
+    """
+    BS4 解析到 0 条时，用正则扫描整页 href，提取礼品 ID / URL；
+    在链接前取最后一个 scoreLeft，链接后取第一个 scoreUse。
+    """
+    raw = _strip_to_html(html)
+    if not raw:
+        return []
+
+    pat_left = re.compile(r'<div\s+class="[^"]*scoreLeft[^"]*"[^>]*>([^<]*)</div>', re.I)
+    pat_use = re.compile(r'<div\s+class="[^"]*scoreUse[^"]*"[^>]*>([^<]*)</div>', re.I)
+    pat_title = re.compile(
+        r'<a\s+href\s*=\s*["\'][^"\']*duihuan\.smzdm\.com/d/\d+[^"\']*["\'][^>]*>([^<]+)',
+        re.I,
+    )
+    pat_secret = re.compile(
+        r'<div\s+class="[^"]*subNoticeYellow[^"]*"[^>]*>([^<]*)</div>',
+        re.I,
+    )
+    records: List[GiftRecord] = []
+
+    for m in _RE_GIFT_HREF.finditer(raw):
+        full_url = (m.group(1) or "").strip()
+        gid = m.group(2) or ""
+        if not gid:
+            continue
+        before = raw[max(0, m.start() - 800) : m.start()]
+        after = raw[m.end() : m.end() + 600]
+        lefts = pat_left.findall(before)
+        date_text = (lefts[-1] or "").strip() if lefts else ""
+        uses = pat_use.findall(after)
+        status = (uses[0] or "").strip() if uses else ""
+        tm = pat_title.search(before + raw[m.start() : m.end() + 200])
+        title = (tm.group(1) or "").strip() if tm else f"礼品 {gid}"
+        title = _clean_title(re.sub(r"<[^>]+>", " ", title).strip() or f"礼品 {gid}")
+        secrets = pat_secret.findall(before + after)
+        secret = (secrets[0] or "").replace("\xa0", " ").strip() if secrets else ""
+        records.append(
+            GiftRecord(
+                title=title,
+                url=full_url,
+                status=status,
+                date_text=date_text,
+                secret=secret,
+                gift_id=gid,
+            )
+        )
+    return records
+
+
+def parse_gift_records(html: str) -> List[GiftRecord]:
+    """
+    解析「我的礼品」页 HTML。先 BS4 find_all/find；若 0 条则用正则回退。
+    """
+    html = _strip_to_html(html)
+    if not html:
+        return []
+
+    if BeautifulSoup is None:
+        raise RuntimeError("缺少依赖 beautifulsoup4：请先 pip install beautifulsoup4")
+
+    soup = BeautifulSoup(html, "html.parser")
+    # 用正则匹配 class，兼容多 class、空格等
+    rows = soup.find_all("div", class_=re.compile(r"infoScoreListGrey", re.I))
+    records: List[GiftRecord] = []
+
+    for item in rows:
+        try:
+            date_div = item.find("div", class_=re.compile(r"scoreLeft", re.I))
+            date_text = date_div.get_text(strip=True) if date_div else ""
+
+            a = None
+            title_span = item.find("span", class_=re.compile(r"titleArrow", re.I))
+            if title_span:
+                a = title_span.find("a")
+            if not a:
+                for tag in item.find_all("a", href=True):
+                    href = tag.get("href") or ""
+                    if re.search(r"duihuan\.smzdm\.com/d/\d+", href):
+                        a = tag
+                        break
+            title = _clean_title(a.get_text(" ", strip=True) if a else "")
+            url = (a.get("href") or "").strip() if a else ""
+
+            status_div = item.find("div", class_=re.compile(r"scoreUse", re.I))
+            status = status_div.get_text(strip=True) if status_div else ""
+
+            secret_div = item.find("div", class_=re.compile(r"subNoticeYellow", re.I))
+            secret = ""
+            if secret_div:
+                secret = (
+                    secret_div.get_text(" ", strip=True).replace("\xa0", " ").strip()
+                )
+
+            gift_id = _extract_gift_id(url)
+            if not gift_id:
+                continue
+
+            records.append(
+                GiftRecord(
+                    title=title or f"礼品 {gift_id}",
+                    url=url,
+                    status=status,
+                    date_text=date_text,
+                    secret=secret,
+                    gift_id=gift_id,
+                )
+            )
+        except Exception:
             continue
 
-        data_pre_p = item.get("data_pre_p", "") or ""
-        price_text = item.get("price_text", "") or ""
+    if not records:
+        records = _parse_gift_records_regex(html)
 
-        # 提取价格数值
-        cost_value = 0
-        m_num = re.search(r"(\d+)", data_pre_p)
-        if m_num:
-            cost_value = int(m_num.group(1))
-        else:
-            m2 = re.search(r"(\d+)", price_text)
-            cost_value = int(m2.group(1)) if m2 else 0
+    return records
 
-        # 判断金币/碎银
-        if "金币" in data_pre_p or "金币" in price_text:
-            cost_type = "gold"
-        else:
-            cost_type = "silver"
 
-        claimed_raw = str(item.get("claimed") or "").strip()
-        remaining_raw = str(item.get("remaining") or "").strip()
-        claimed = int(claimed_raw) if claimed_raw.isdigit() else 0
-        remaining = int(remaining_raw) if remaining_raw.isdigit() else 0
+def pick_record_by_id(records: List[GiftRecord], gift_id: str) -> Optional[GiftRecord]:
+    gift_id = (gift_id or "").strip()
+    if not gift_id:
+        return None
+    for r in records:
+        if r.gift_id == gift_id:
+            return r
+    return None
 
-        gift_rows.append(
-            {
-                "gift_id": gift_id,
-                "name": item.get("name", ""),
-                "cost_value": cost_value,
-                "cost_type": cost_type,
-                "remaining": remaining,
-                "claimed": claimed,
-                "data_pre_p": data_pre_p,
-                "price_text": price_text,
-            }
+
+def _run_one(
+    page_html: str,
+    gift_id: str,
+    *,
+    from_file: bool = False,
+) -> int:
+    """解析 HTML、打印结果。返回解析到的记录数。"""
+    records = parse_gift_records(page_html)
+    return _run_one_from_records(
+        records, gift_id, page_html=page_html, from_file=from_file, merged_pages=False
+    )
+
+
+def _run_one_from_records(
+    records: List[GiftRecord],
+    gift_id: str,
+    *,
+    page_html: Optional[str] = None,
+    from_file: bool = False,
+    merged_pages: bool = False,
+) -> int:
+    """根据已解析的记录打印结果；若无记录且提供 page_html 则打调试信息。"""
+    suffix = "（已合并全部分页）" if merged_pages else ""
+    print(f"解析到礼品记录条数：{len(records)}{suffix}")
+
+    if not records and page_html:
+        clean = _strip_to_html(page_html)
+        has_block = "infoScoreListGrey" in clean
+        has_gift = "duihuan.smzdm.com/d/" in clean
+        print(
+            f"  [调试] HTML 长度 {len(clean)} | "
+            f"含 infoScoreListGrey: {has_block} | 含 duihuan.smzdm.com/d/: {has_gift}"
         )
+        if not has_gift:
+            msg = "疑似非「我的礼品」页（如登录页）"
+            if not from_file:
+                msg += "，请检查 cookie 或设置 SMZDM_GIFT_HTML_FILE 用本地 HTML 测试"
+            print(f"  [调试] {msg}。")
 
-    if gift_rows:
-        save_gift_items(gift_rows)
-        print(f"\n已将 {len(gift_rows)} 条礼品兑换商品写入数据库。")
-        bark_notify("什么值得买兑换商品更新", f"共 {len(gift_rows)} 条礼品兑换数据已更新入库")
+    hit = pick_record_by_id(records, gift_id)
+    if hit:
+        print("目标礼品：")
+        print("  标题：", hit.title)
+        print("  链接：", hit.url)
+        print("  状态：", hit.status)
+        print("  时间：", hit.date_text)
+        print("  券码：", hit.secret or "(页面未展示/暂无)")
+    else:
+        print("未在列表中找到目标礼品 ID，预览前 5 条：")
+        for r in records[:5]:
+            extra = f" | {r.secret}" if r.secret else ""
+            print(f"- {r.date_text} | {r.status} | {r.gift_id} | {r.title}{extra}")
+    return len(records)
 
-    # 统计信息
-    print(f"\n=== 统计信息 ===")
-    print(f"优惠券数量: {len(all_data['coupons'])}")
-    print(f"幸运屋商品数量: {len(all_data['lucky_items'])}")
-    print(f"礼品兑换数量: {len(all_data['exchange_items'])}")
 
-    # 保存数据文件（调试可用）
-    save_to_json(all_data, 'smzdm_data.json')
-    save_to_csv(all_data, 'smzdm_exchange.csv')
-
+def main() -> None:
+    smzdm_duihuan = os.getenv("smzdm_duihuan")
+    if not smzdm_duihuan:
+        print("未设置 smzdm_duihuan 环境变量")
+        return
+    
+    cookie_list = [c for c in smzdm_duihuan.split("#") if c.strip()]
+    
+    for idx, cookie in enumerate(cookie_list, start=1):
+        print(f"开始第{idx}个账号：")
+        time.sleep(3)
+        
+        # 获取第一页
+        page1 = get_gift_page(cookie, 1)
+        
+        if page1.startswith("请求礼品页面失败"):
+            print(f"  请求失败: {page1}")
+            continue
+        
+        # 解析礼品记录
+        records = parse_gift_records(page1)
+        
+        if records:
+            print(f"  找到 {len(records)} 条礼品记录:")
+            for i, record in enumerate(records, 1):
+                # 构建输出字符串
+                output = f"    {i}. {record.date_text} | {record.status} | {record.title}"
+                
+                # 如果状态是审核通过且有券码信息，则添加券码
+                if "审核通过" in record.status and record.secret:
+                    output += f" | 券码: {record.secret}"
+                
+                print(output)
+        else:
+            print("  未找到礼品记录")
+            
+        print("-" * 50)
 if __name__ == "__main__":
     main()
