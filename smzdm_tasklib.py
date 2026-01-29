@@ -969,4 +969,3 @@ class SmzdmTaskBot(SmzdmBot):
 
 
 __all__ = ["SmzdmTaskBot"]
-
