@@ -17,7 +17,7 @@ def init_db() -> None:
 
     按需求建立三张表：
     1) checkin_logs：签到 & 资产变动记录（账号、碎银、金币、时间）
-    2) gift_items：商品信息（由 smzdm_chaxun.py 爬取）
+    2) gift_items：商品信息（由 smzdm_duihuan1 爬取）
     3) exchange_logs：兑换记录（由兑换脚本写入）
     """
     conn = _get_conn()
@@ -197,6 +197,36 @@ def save_gift_items(items: Iterable[Dict[str, Any]]) -> None:
     conn.close()
 
 
+def list_gift_items() -> list:
+    """
+    返回数据库中的礼品列表，用于控制台打印。
+    每项含 gift_id, name, cost_value, cost_type, remaining, claimed, price_text 等。
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT gift_id, name, cost_value, cost_type, remaining, claimed, price_text
+        FROM gift_items
+        ORDER BY cost_type, cost_value DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "gift_id": str(r[0]),
+            "name": str(r[1]),
+            "cost_value": int(r[2]),
+            "cost_type": str(r[3]),
+            "remaining": int(r[4]),
+            "claimed": int(r[5]),
+            "price_text": str(r[6] or ""),
+        }
+        for r in rows
+    ]
+
+
 def pick_best_affordable_gift(silver: int) -> Optional[Dict[str, Any]]:
     """
     挑选当前碎银可兑换的最高档礼品（只看 cost_type='silver'）。
@@ -256,4 +286,3 @@ def record_exchange(
     )
     conn.commit()
     conn.close()
-
