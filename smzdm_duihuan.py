@@ -1,0 +1,349 @@
+import re
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Dict
+import json
+import os
+
+from smzdm_bot import bark_notify
+from smzdm_db import init_db, save_gift_items
+
+
+def h_html(cookie: str, out_file: str = "smzdm_response.html") -> str:
+    url = "https://duihuan.smzdm.com/"
+
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "cache-control": "max-age=0",
+        "cookie": cookie,
+        # "priority": "u=0, i",
+        # "referer": "https://duihuan.smzdm.com/",
+        # "sec-ch-ua": '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+        # "sec-ch-ua-mobile": "?0",
+        # "sec-ch-ua-platform": '"Windows"',
+        # "sec-fetch-dest": "document",
+        # "sec-fetch-mode": "navigate",
+        # "sec-fetch-site": "same-origin",
+        # "sec-fetch-user": "?1",
+        # "upgrade-insecure-requests": "1",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+    }
+
+    # 发送GET请求
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        
+        # # 打印响应状态码
+        # print(f"状态码: {response.status_code}")
+        # print(f"响应头: {response.headers}")
+        
+        # # 打印响应内容（前500个字符）
+        # print(f"响应内容 (前500字符): {response.text[:500]}...")
+        
+        # 保存响应到文件（便于排查）
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(response.text)
+        print(f"响应已保存到 {out_file}")
+
+        return response.text
+        
+    except requests.exceptions.RequestException as e:
+        print(f"请求失败: {e}")
+        return ""
+
+
+
+def parse_exchange_items(html_content: str) -> List[Dict]:
+    """解析礼品兑换信息"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # 找到所有礼品兑换项
+    exchange_items = soup.find_all('li', class_='exchange-item')
+    
+    results = []
+    
+    for item in exchange_items:
+        try:
+            # 提取礼品链接
+            link_tag = item.find('a', class_='exchange-link')
+            name = link_tag.text.strip() if link_tag else "未知商品"
+            
+            href_tag = item.find('a', class_='exchange-image')
+            href = href_tag.get('href', '') if href_tag else ""
+            full_url = f"https://duihuan.smzdm.com{href}" if href else ""
+            
+            # 提取data-pre-p属性（价格）
+            price_div = item.find('div', class_='ticket-info-bottom')
+            data_pre_p = price_div.get('data-pre-p', '') if price_div else ""
+            
+            # 提取显示的价格文本（如"3000金币"）
+            price_span = price_div.find('span') if price_div else None
+            price_text = price_span.text.strip() if price_span else ""
+            
+            # 提取已领和剩余数量
+            info_top = item.find('div', class_='ticket-info-top')
+            claimed = ""
+            remaining = ""
+            
+            if info_top:
+                # 查找所有文本节点
+                texts = info_top.find_all(text=True, recursive=False)
+                spans = info_top.find_all('span')
+                
+                # 提取已领数量（第一个span后的文本）
+                if spans and len(spans) > 0:
+                    # 获取第一个span后面的文本
+                    for node in info_top.contents:
+                        if node.name == 'span' and '已领' in str(node):
+                            # 获取这个span后面的文本节点
+                            next_node = node.next_sibling
+                            if next_node:
+                                claimed = str(next_node).strip()
+                                break
+                
+                # 提取剩余数量（第二个span的span标签内的文本）
+                if len(spans) > 1:
+                    second_span = spans[1]
+                    remaining_span = second_span.find_next('span', class_='ticket-info-red')
+                    if remaining_span:
+                        remaining = remaining_span.text.strip()
+            
+            # 添加到结果列表
+            results.append({
+                'name': name,
+                'href': href,
+                'full_url': full_url,
+                'data_pre_p': data_pre_p,
+                'price_text': price_text,
+                'claimed': claimed,
+                'remaining': remaining
+            })
+            
+        except Exception as e:
+            print(f"解析错误: {e}")
+            continue
+    
+    return results
+
+def parse_all_items(html_content: str) -> Dict:
+    """解析所有类型的商品信息"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    results = {
+        'coupons': [],  # 优惠券
+        'lucky_items': [],  # 幸运屋
+        'exchange_items': []  # 礼品兑换
+    }
+    
+    # 1. 解析优惠券
+    discount_items = soup.find_all('li', class_='ticket')
+    for item in discount_items:
+        try:
+            # 提取优惠券名称
+            title_tag = item.find('div', class_='ticket-title').find('a')
+            name = title_tag.text.strip() if title_tag else ""
+            href = title_tag.get('href', '') if title_tag else ""
+            
+            # 提取价格
+            cost_div = item.find('div', class_='ticket-cost')
+            price = cost_div.find('span').text.strip() if cost_div else ""
+            price_unit = "金币" if cost_div else ""
+            
+            results['coupons'].append({
+                'name': name,
+                'href': href,
+                'price': f"{price}{price_unit}"
+            })
+        except:
+            continue
+    
+    # 2. 解析幸运屋商品
+    lucky_items = soup.find_all('li', class_='lucky-border')
+    for item in lucky_items:
+        try:
+            title_tag = item.find('a', class_='title')
+            name = title_tag.text.strip() if title_tag else ""
+            
+            # 提取进度数据
+            data_div = item.find('div', class_='data')
+            progress_data = data_div.text.strip() if data_div else ""
+            
+            # 解析进度数据（格式：11809/21331）
+            if '/' in progress_data:
+                current, total = progress_data.split('/')
+                progress = {
+                    'current': current.strip(),
+                    'total': total.strip(),
+                    'percentage': f"{int(current)/int(total)*100:.1f}%" if current.isdigit() and total.isdigit() else "0%"
+                }
+            else:
+                progress = {'current': '0', 'total': '0', 'percentage': '0%'}
+            
+            results['lucky_items'].append({
+                'name': name,
+                'progress': progress
+            })
+        except:
+            continue
+    
+    # 3. 解析礼品兑换（使用上面定义的函数）
+    results['exchange_items'] = parse_exchange_items(html_content)
+    
+    return results
+
+def save_to_json(data: Dict, filename: str):
+    """保存数据到JSON文件"""
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"数据已保存到 {filename}")
+
+def save_to_csv(data: Dict, filename: str):
+    """保存礼品兑换数据到CSV文件"""
+    import csv
+    
+    # 只保存礼品兑换数据
+    exchange_items = data.get('exchange_items', [])
+    
+    if not exchange_items:
+        print("没有礼品兑换数据")
+        return
+    
+    with open(filename, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        # 写入表头
+        writer.writerow(['商品名称', '链接', '完整URL', 'data-pre-p属性', '价格文本', '已领数量', '剩余数量'])
+        
+        # 写入数据
+        for item in exchange_items:
+            writer.writerow([
+                item['name'],
+                item['href'],
+                item['full_url'],
+                item['data_pre_p'],
+                item['price_text'],
+                item['claimed'],
+                item['remaining']
+            ])
+    
+    print(f"CSV数据已保存到 {filename}")
+
+def main():
+    # 这里只负责爬取兑换首页的商品列表，并将礼品兑换区块写入 sqlite3。
+    # Cookie 使用新的 smzdm_duihuan / smzdm_safe 方案中的完整 cookie 串。
+    raw = os.getenv("smzdm_duihuan", "") or ""
+    if not raw:
+        print("\n请先设置 smzdm_duihuan 环境变量")
+        return
+
+    init_db()
+
+    cookie_list = [c.strip() for c in raw.split("#") if c.strip()]
+    if not cookie_list:
+        print("\nsmzdm_duihuan 环境变量为空")
+        return
+
+    all_data = None
+
+    # 按顺序尝试 cookie：没数据就换下一个；有数据就停止
+    for idx, cookie in enumerate(cookie_list, start=1):
+        print(f"\n开始使用第 {idx} 个 cookie 请求兑换首页...")
+        html_content = h_html(cookie=cookie, out_file=f"smzdm_response_{idx}.html")
+        if not html_content:
+            print("本次未获取到 HTML，尝试下一个 cookie...")
+            continue
+
+        print("开始解析数据...")
+        parsed = parse_all_items(html_content)
+
+        # 以“礼品兑换列表”为是否成功的判断依据
+        exchange_items = parsed.get("exchange_items", []) if isinstance(parsed, dict) else []
+        if exchange_items:
+            all_data = parsed
+            print(f"已成功解析到 {len(exchange_items)} 个礼品兑换条目，停止尝试后续 cookie。")
+            break
+
+        print("未解析到礼品兑换数据，尝试下一个 cookie...")
+    
+    if not all_data:
+        print("\n所有 cookie 都未解析到礼品兑换数据。")
+        bark_notify("什么值得买兑换页抓取失败", "所有账号均未获取到礼品兑换列表")
+        return
+
+    # 打印礼品兑换信息
+    print("\n=== 礼品兑换信息 ===")
+    for i, item in enumerate(all_data['exchange_items'], 1):
+        print(f"\n商品 {i}:")
+        print(f"  名称: {item['name']}")
+        print(f"  链接: {item['href']}")
+        print(f"  完整URL: {item['full_url']}")
+        print(f"  data-pre-p: {item['data_pre_p']}")
+        print(f"  价格: {item['price_text']}")
+        print(f"  已领: {item['claimed']}")
+        print(f"  剩余: {item['remaining']}")
+
+    # 写入数据库 gift_items
+    def _extract_gift_id_from_href(href: str) -> str:
+        m = re.search(r"/d/(\d+)", href or "")
+        return m.group(1) if m else ""
+
+    gift_rows = []
+    for item in all_data["exchange_items"]:
+        gift_id = _extract_gift_id_from_href(item.get("href", ""))
+        if not gift_id:
+            continue
+
+        data_pre_p = item.get("data_pre_p", "") or ""
+        price_text = item.get("price_text", "") or ""
+
+        # 提取价格数值
+        cost_value = 0
+        m_num = re.search(r"(\d+)", data_pre_p)
+        if m_num:
+            cost_value = int(m_num.group(1))
+        else:
+            m2 = re.search(r"(\d+)", price_text)
+            cost_value = int(m2.group(1)) if m2 else 0
+
+        # 判断金币/碎银
+        if "金币" in data_pre_p or "金币" in price_text:
+            cost_type = "gold"
+        else:
+            cost_type = "silver"
+
+        claimed_raw = str(item.get("claimed") or "").strip()
+        remaining_raw = str(item.get("remaining") or "").strip()
+        claimed = int(claimed_raw) if claimed_raw.isdigit() else 0
+        remaining = int(remaining_raw) if remaining_raw.isdigit() else 0
+
+        gift_rows.append(
+            {
+                "gift_id": gift_id,
+                "name": item.get("name", ""),
+                "cost_value": cost_value,
+                "cost_type": cost_type,
+                "remaining": remaining,
+                "claimed": claimed,
+                "data_pre_p": data_pre_p,
+                "price_text": price_text,
+            }
+        )
+
+    if gift_rows:
+        save_gift_items(gift_rows)
+        print(f"\n已将 {len(gift_rows)} 条礼品兑换商品写入数据库。")
+        bark_notify("什么值得买兑换商品更新", f"共 {len(gift_rows)} 条礼品兑换数据已更新入库")
+
+    # 统计信息
+    print(f"\n=== 统计信息 ===")
+    print(f"优惠券数量: {len(all_data['coupons'])}")
+    print(f"幸运屋商品数量: {len(all_data['lucky_items'])}")
+    print(f"礼品兑换数量: {len(all_data['exchange_items'])}")
+
+    # 保存数据文件（调试可用）
+    save_to_json(all_data, 'smzdm_data.json')
+    save_to_csv(all_data, 'smzdm_exchange.csv')
+
+if __name__ == "__main__":
+    main()
