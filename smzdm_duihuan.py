@@ -2,10 +2,10 @@
 兑换礼品 + 获取「我的礼品」列表并解析审核状态/券码。
 
 环境变量：
-- SMZDM_COOKIE: cookies#安全码
-  - 可配置多账号：用 & 或换行分隔多个条目
-  - 例：SMZDM_COOKIE="cookie1#pass1&cookie2#pass2"
-- SMZDM_GIFT_ID: 要兑换的礼品 ID（默认 800911）
+- SMZDM_COOKIE: 「cookies;en_safepass=123456;」这样的结构
+  - 可配置多账号：用 & 分隔多个条目
+  - 例：SMZDM_COOKIE="cookie1;en_safepass=111111;&cookie2;en_safepass=222222;"
+- SMZDM_GIFT_ID: 要兑换的礼品 ID（默认 800626）
 - SMZDM_GIFT_HTML_FILE: 若设置，从该文件读取 HTML（调试用，不请求网络）
 - SMZDM_DEBUG_HTML: 设为 1 时，将请求到的 HTML 保存为 smzdm_gift_debug.html
 """
@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import List, Optional
 import time
 import requests
 
@@ -24,7 +25,7 @@ try:
 except Exception:  # pragma: no cover
     BeautifulSoup = None  # type: ignore[assignment]
 
-from smzdm_bot import get_env_cookies_raw, PROXIES
+
 
 
 UA_PC = (
@@ -52,30 +53,6 @@ def _strip_to_html(text: str) -> str:
         return ""
     m = re.search(r"(?is)(<!doctype\s+html|<html\b)", text)
     return text[m.start() :] if m else text
-
-
-def _split_cookie_and_safe_pass(raw_cookie: str) -> tuple[str, str]:
-    """
-    输入：cookies#安全码
-    输出：(cookies, 安全码)
-    """
-    raw_cookie = (raw_cookie or "").strip()
-    if "#" not in raw_cookie:
-        return raw_cookie, ""
-    cookie, safe_pass = raw_cookie.split("#", 1)
-    return cookie.strip(), safe_pass.strip()
-
-
-def iter_cookie_pairs() -> Iterable[tuple[str, str]]:
-    """
-    从项目环境变量读取 cookies 列表，并拆出 cookie/safe_pass。
-    """
-    # 兑换任务需要拿到带 # 的原始值，再手动拆出安全码
-    raw_list = get_env_cookies_raw() or []
-    for raw in raw_list:
-        cookie, safe_pass = _split_cookie_and_safe_pass(raw)
-        if cookie:
-            yield cookie, safe_pass
 
 
 def post_exchange(cookie: str, safe_pass: str, gift_id: str) -> dict:
@@ -106,33 +83,19 @@ def post_exchange(cookie: str, safe_pass: str, gift_id: str) -> dict:
         "client_type": "PC",
         "sourcePage": f"https://duihuan.smzdm.com/d/{gift_id}/",
     }
-
-    # 先走 SOCKS5 代理，如果失败再直连
-    proxy_enabled = bool(PROXIES)
-    last_error: Optional[Exception] = None
-
-    for _ in range(2):
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            data=data,
+            timeout=20,
+        )
         try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                data=data,
-                timeout=20,
-                proxies=PROXIES if proxy_enabled else None,
-            )
-            try:
-                return resp.json()
-            except Exception:
-                return {"status_code": resp.status_code, "text": resp.text}
-        except Exception as e:
-            last_error = e
-            if proxy_enabled:
-                # 代理失败，关掉代理再试一次
-                proxy_enabled = False
-                continue
-            break
-
-    return {"isSuccess": False, "error": repr(last_error)}
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text}
+    except Exception as e:
+        return {"isSuccess": False, "error": repr(e)}
 
 
 def get_gift_page(cookie: str, page: int = 1) -> str:
@@ -163,27 +126,56 @@ def get_gift_page(cookie: str, page: int = 1) -> str:
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
         "Cookie": cookie,
     }
+    try:
+        resp = requests.get(
+            url,
+            headers=headers,
+            timeout=20,
+        )
+        return resp.text
+    except Exception as e:
+        return f"请求礼品页面失败: {e!r}"
 
-    proxy_enabled = bool(PROXIES)
-    last_error: Optional[Exception] = None
 
-    for _ in range(2):
-        try:
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=20,
-                proxies=PROXIES if proxy_enabled else None,
-            )
-            return resp.text
-        except Exception as e:
-            last_error = e
-            if proxy_enabled:
-                proxy_enabled = False
-                continue
-            break
+def get_user_info(cookie: str) -> Optional[dict]:
+    """
+    使用账户 cookies 请求当前账户信息（昵称 / 金币 / 银币）。
+    """
+    url = (
+        "https://zhiyou.smzdm.com/user/info/jsonp_get_current"
+        "?with_avatar_ornament=1&callback=jQuery37105106474483029583_1773055514093"
+        "&_=1773055514094"
+    )
+    headers = {
+        "Host": "zhiyou.smzdm.com",
+        "Connection": "keep-alive",
+        "sec-ch-ua-platform": "Windows",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "sec-ch-ua": 'Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145',
+        "sec-ch-ua-mobile": "?0",
+        "Accept": "*/*",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Dest": "script",
+        "Referer": "https://duihuan.smzdm.com/",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Cookie": cookie,
+    }
 
-    return f"请求礼品页面失败: {last_error!r}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        text = resp.text
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            print("  未能在用户信息响应中找到 JSON 部分")
+            return None
+        data = json.loads(m.group(0))
+        return data
+    except Exception as e:
+        print(f"  获取用户信息失败: {e!r}")
+        return None
 
 
 # 分页链接：/user/gift/p2/、p3/ 等
@@ -428,42 +420,95 @@ def _run_one_from_records(
     return len(records)
 
 
+def _parse_cookie_and_safe_pass(entry: str) -> tuple[str, str]:
+    """
+    解析单个账号字符串：
+    前半部分是 cookies，后面跟着 ;en_safepass=xxxx;，需要拆出安全码。
+    """
+    entry = (entry or "").strip()
+    if not entry:
+        return "", ""
+    # 取最后一个 ;en_safepass=，避免中间意外包含相同片段
+    marker = ";en_safepass="
+    idx = entry.rfind(marker)
+    if idx == -1:
+        return entry, ""
+    # 安全码在 marker 之后、下一个分号之前
+    rest = entry[idx + len(marker) :]
+    safe_pass = rest.split(";", 1)[0].strip()
+    cookie = entry[:idx].rstrip(" ;")
+    return cookie, safe_pass
+
+
 def main() -> None:
-    smzdm_duihuan = os.getenv("smzdm_duihuan")
-    if not smzdm_duihuan:
-        print("未设置 smzdm_duihuan 环境变量")
+    SMZDM_COOKIE = os.getenv("SMZDM_COOKIE")
+    if not SMZDM_COOKIE:
+        print("未设置 SMZDM_COOKIE 环境变量")
         return
-    
-    cookie_list = [c for c in smzdm_duihuan.split("#") if c.strip()]
-    
-    for idx, cookie in enumerate(cookie_list, start=1):
+
+    # 多账号使用 & 分割
+    raw_accounts = [c for c in SMZDM_COOKIE.split("&") if c.strip()]
+
+    for idx, raw in enumerate(raw_accounts, start=1):
         print(f"开始第{idx}个账号：")
-        time.sleep(3)
-        
-        # 获取第一页
+        cookie, safe_pass = _parse_cookie_and_safe_pass(raw)
+        if not cookie:
+            print("  本账号 cookie 为空，跳过")
+            continue
+
+        # 第一步：查询账户信息（昵称 / 金币 / 银币）
+        user_info = get_user_info(cookie)
+        if not user_info:
+            print("  获取账户信息失败，跳过该账号")
+            print("-" * 50)
+            continue
+
+        nickname = user_info.get("nickname")
+        gold = user_info.get("gold")
+        silver = user_info.get("silver")
+        print(f"  昵称: {nickname}")
+        print(f"  金币: {gold}")
+        print(f"  银币: {silver}")
+
+        # 第二步：根据银币决定是否尝试兑换
+        try:
+            silver_val = int(silver) if silver is not None else 0
+        except (TypeError, ValueError):
+            silver_val = 0
+
+        gift_id = os.getenv("SMZDM_GIFT_ID", "800626")
+
+        if silver_val < 600:
+            print("  银币不足 600，不尝试兑换。")
+        else:
+            print(f"  银币充足，尝试兑换礼品 {gift_id} ...")
+            resp = post_exchange(cookie, safe_pass, gift_id)
+            print(f"  兑换接口返回: {resp}")
+
+        time.sleep(2)
+
+        # 第三步：查询「我的礼品」第一页，并解析卷码信息（只展示前三条）
         page1 = get_gift_page(cookie, 1)
-        
+
         if page1.startswith("请求礼品页面失败"):
             print(f"  请求失败: {page1}")
+            print("-" * 50)
             continue
-        
-        # 解析礼品记录
+
         records = parse_gift_records(page1)
-        
+
         if records:
-            print(f"  找到 {len(records)} 条礼品记录:")
-            for i, record in enumerate(records, 1):
-                # 构建输出字符串
-                output = f"    {i}. {record.date_text} | {record.status} | {record.title}"
-                
-                # 如果状态是审核通过且有券码信息，则添加券码
+            print(f"  找到 {len(records)} 条礼品记录（仅展示前 3 条）:")
+            for i, record in enumerate(records[:3], 1):
+                output = (
+                    f"    {i}. {record.date_text} | {record.status} | {record.title}"
+                )
                 if "审核通过" in record.status and record.secret:
                     output += f" | 券码: {record.secret}"
-                
                 print(output)
         else:
             print("  未找到礼品记录")
-            
+
         print("-" * 50)
 if __name__ == "__main__":
     main()
