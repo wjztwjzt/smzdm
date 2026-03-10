@@ -2,7 +2,7 @@
 兑换礼品 + 获取「我的礼品」列表并解析审核状态/券码。
 
 环境变量：
-- SMZDM_COOKIE: 「cookies;en_safepass=123456;」这样的结构
+- SMZDM_COOKIE: 「cookies;en_safepass=368041;」这样的结构
   - 可配置多账号：用 & 分隔多个条目
   - 例：SMZDM_COOKIE="cookie1;en_safepass=111111;&cookie2;en_safepass=222222;"
 - SMZDM_GIFT_ID: 要兑换的礼品 ID（默认 800626）
@@ -17,15 +17,27 @@ import re
 import json
 from dataclasses import dataclass
 from typing import List, Optional
+import builtins
 import time
 import requests
+from notify import send
+
 
 try:
     from bs4 import BeautifulSoup
 except Exception:  # pragma: no cover
     BeautifulSoup = None  # type: ignore[assignment]
+mse: list[str] = []
 
 
+def log(message: str) -> None:
+    """
+    简单日志函数：
+    - 打印一行字符串
+    - 同时把该字符串追加到全局 mse 列表中
+    """
+    builtins.print(message)
+    mse.append(message)
 
 
 UA_PC = (
@@ -169,51 +181,13 @@ def get_user_info(cookie: str) -> Optional[dict]:
         text = resp.text
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            print("  未能在用户信息响应中找到 JSON 部分")
+            log("  未能在用户信息响应中找到 JSON 部分")
             return None
         data = json.loads(m.group(0))
         return data
     except Exception as e:
-        print(f"  获取用户信息失败: {e!r}")
+        log(f"  获取用户信息失败: {e!r}")
         return None
-
-
-# 分页链接：/user/gift/p2/、p3/ 等
-_RE_PAGE = re.compile(r"/user/gift/p(\d+)/", re.I)
-
-
-def _parse_max_page(html: str) -> int:
-    """从分页区解析最大页码，未找到则返回 1。"""
-    raw = _strip_to_html(html)
-    nums = [int(m.group(1)) for m in _RE_PAGE.finditer(raw)]
-    return max(nums, default=1)
-
-
-def get_all_gift_pages(cookie: str) -> tuple[List[GiftRecord], str]:
-    """
-    拉取所有分页的「我的礼品」，解析后合并为一条记录列表。
-    返回 (记录列表, 第 1 页 HTML)，供调试保存用。
-    """
-    all_records: List[GiftRecord] = []
-    page1 = get_gift_page(cookie, 1)
-    if page1.startswith("请求礼品页面失败"):
-        return all_records, page1
-
-    first = parse_gift_records(page1)
-    all_records.extend(first)
-    max_page = _parse_max_page(page1)
-    if max_page <= 1:
-        return all_records, page1
-
-    for p in range(2, max_page + 1):
-        html = get_gift_page(cookie, p)
-        if html.startswith("请求礼品页面失败"):
-            break
-        rec = parse_gift_records(html)
-        all_records.extend(rec)
-        if not rec:
-            break
-    return all_records, page1
 
 
 def _extract_gift_id(url: str) -> str:
@@ -355,71 +329,6 @@ def parse_gift_records(html: str) -> List[GiftRecord]:
     return records
 
 
-def pick_record_by_id(records: List[GiftRecord], gift_id: str) -> Optional[GiftRecord]:
-    gift_id = (gift_id or "").strip()
-    if not gift_id:
-        return None
-    for r in records:
-        if r.gift_id == gift_id:
-            return r
-    return None
-
-
-def _run_one(
-    page_html: str,
-    gift_id: str,
-    *,
-    from_file: bool = False,
-) -> int:
-    """解析 HTML、打印结果。返回解析到的记录数。"""
-    records = parse_gift_records(page_html)
-    return _run_one_from_records(
-        records, gift_id, page_html=page_html, from_file=from_file, merged_pages=False
-    )
-
-
-def _run_one_from_records(
-    records: List[GiftRecord],
-    gift_id: str,
-    *,
-    page_html: Optional[str] = None,
-    from_file: bool = False,
-    merged_pages: bool = False,
-) -> int:
-    """根据已解析的记录打印结果；若无记录且提供 page_html 则打调试信息。"""
-    suffix = "（已合并全部分页）" if merged_pages else ""
-    print(f"解析到礼品记录条数：{len(records)}{suffix}")
-
-    if not records and page_html:
-        clean = _strip_to_html(page_html)
-        has_block = "infoScoreListGrey" in clean
-        has_gift = "duihuan.smzdm.com/d/" in clean
-        print(
-            f"  [调试] HTML 长度 {len(clean)} | "
-            f"含 infoScoreListGrey: {has_block} | 含 duihuan.smzdm.com/d/: {has_gift}"
-        )
-        if not has_gift:
-            msg = "疑似非「我的礼品」页（如登录页）"
-            if not from_file:
-                msg += "，请检查 cookie 或设置 SMZDM_GIFT_HTML_FILE 用本地 HTML 测试"
-            print(f"  [调试] {msg}。")
-
-    hit = pick_record_by_id(records, gift_id)
-    if hit:
-        print("目标礼品：")
-        print("  标题：", hit.title)
-        print("  链接：", hit.url)
-        print("  状态：", hit.status)
-        print("  时间：", hit.date_text)
-        print("  券码：", hit.secret or "(页面未展示/暂无)")
-    else:
-        print("未在列表中找到目标礼品 ID，预览前 5 条：")
-        for r in records[:5]:
-            extra = f" | {r.secret}" if r.secret else ""
-            print(f"- {r.date_text} | {r.status} | {r.gift_id} | {r.title}{extra}")
-    return len(records)
-
-
 def _parse_cookie_and_safe_pass(entry: str) -> tuple[str, str]:
     """
     解析单个账号字符串：
@@ -443,33 +352,33 @@ def _parse_cookie_and_safe_pass(entry: str) -> tuple[str, str]:
 def main() -> None:
     SMZDM_COOKIE = os.getenv("SMZDM_COOKIE")
     if not SMZDM_COOKIE:
-        print("未设置 SMZDM_COOKIE 环境变量")
+        log("未设置 SMZDM_COOKIE 环境变量")
         return
 
     # 多账号使用 & 分割
     raw_accounts = [c for c in SMZDM_COOKIE.split("&") if c.strip()]
 
     for idx, raw in enumerate(raw_accounts, start=1):
-        print(f"开始第{idx}个账号：")
+        log(f"开始第{idx}个账号：")
         cookie, safe_pass = _parse_cookie_and_safe_pass(raw)
         if not cookie:
-            print("  本账号 cookie 为空，跳过")
+            log("  本账号 cookie 为空，跳过")
             continue
 
         # 第一步：查询账户信息（昵称 / 金币 / 银币）
         user_info = get_user_info(cookie)
         if not user_info:
-            print("  获取账户信息失败，跳过该账号")
-            print("-" * 50)
+            log("  获取账户信息失败，跳过该账号")
+            log("-" * 50)
             continue
 
         nickname = user_info.get("nickname")
         gold = user_info.get("gold")
         silver = user_info.get("silver")
-        print(f"  昵称: {nickname}")
-        print(f"  金币: {gold}")
-        print(f"  银币: {silver}")
-
+        log(f"  昵称: {nickname}")
+        log(f"  金币: {gold}")
+        log(f"  银币: {silver}")
+       
         # 第二步：根据银币决定是否尝试兑换
         try:
             silver_val = int(silver) if silver is not None else 0
@@ -479,11 +388,11 @@ def main() -> None:
         gift_id = os.getenv("SMZDM_GIFT_ID", "800626")
 
         if silver_val < 600:
-            print("  银币不足 600，不尝试兑换。")
+            log("  银币不足 600，不尝试兑换。")
         else:
-            print(f"  银币充足，尝试兑换礼品 {gift_id} ...")
+            log(f"  银币充足，尝试兑换礼品 {gift_id} ...")
             resp = post_exchange(cookie, safe_pass, gift_id)
-            print(f"  兑换接口返回: {resp}")
+            log(f"  兑换接口返回: {resp}")
 
         time.sleep(2)
 
@@ -491,24 +400,30 @@ def main() -> None:
         page1 = get_gift_page(cookie, 1)
 
         if page1.startswith("请求礼品页面失败"):
-            print(f"  请求失败: {page1}")
-            print("-" * 50)
+            log(f"  请求失败: {page1}")
+            log("-" * 50)
             continue
 
         records = parse_gift_records(page1)
 
         if records:
-            print(f"  找到 {len(records)} 条礼品记录（仅展示前 3 条）:")
+            log(f"  找到 {len(records)} 条礼品记录（仅展示前 3 条）:")
             for i, record in enumerate(records[:3], 1):
                 output = (
                     f"    {i}. {record.date_text} | {record.status} | {record.title}"
                 )
                 if "审核通过" in record.status and record.secret:
                     output += f" | 券码: {record.secret}"
-                print(output)
+                log(output)
         else:
-            print("  未找到礼品记录")
+            log("  未找到礼品记录")
 
-        print("-" * 50)
+            log("-" * 50)
+
+    # 所有账号处理完毕后，把所有打印信息合并成一段文案发送通知
+    if mse:
+        send("什么值得买兑换", "\n".join(mse))
+
+
 if __name__ == "__main__":
     main()
